@@ -30,7 +30,7 @@ Windows may show a "Windows protected your PC" warning because the app isn't cod
 
 ### Hotkey
 
-**Ctrl + Alt + M** restores your previous setup at any time, even when the window is hidden in the system tray.
+**Ctrl + Alt + M** restores your previous setup at any time, even when the window is hidden in the system tray. If another app already uses that shortcut, the app switches to **Ctrl + Alt + Shift + M** and shows which one is active.
 
 ### Command-line options
 

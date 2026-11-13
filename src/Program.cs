@@ -19,7 +19,7 @@ static class Program
             var c = AppConfig.Load();
             if (c.Switched)
             {
-                try { Display.Restore(c.SavedLayout); c.Switched = false; c.Save(); Log.Write("Restored via --restore"); }
+                try { Display.Restore(c.SavedLayout, c.SavedTopology); c.Switched = false; c.Save(); Log.Write("Restored via --restore"); }
                 catch (Exception ex)
                 {
                     Log.Write("--restore failed: " + ex);
@@ -91,6 +91,14 @@ class MonInfo
     public string Label => HwCode.Length > 0 ? $"{Name} [{HwCode}]" : Name;
 }
 
+class TopologySnapshot
+{
+    public uint PathCount { get; set; }
+    public uint ModeCount { get; set; }
+    public string Paths { get; set; } = "";
+    public string Modes { get; set; } = "";
+}
+
 class AppConfig
 {
     public string DefaultMonitorKey { get; set; } = "";
@@ -101,6 +109,7 @@ class AppConfig
     // Crash-safe state: the layout from before we switched anything
     public bool Switched { get; set; } = false;
     public List<MonInfo> SavedLayout { get; set; } = new();
+    public TopologySnapshot SavedTopology { get; set; }
 
     public static readonly string Dir = ResolveDir();
     static string FilePath => Path.Combine(Dir, "config.json");
@@ -182,7 +191,50 @@ static class Display
 
     [DllImport("user32.dll")]
     static extern int SetDisplayConfig(uint numPaths, IntPtr paths, uint numModes, IntPtr modes, uint flags);
-    const uint SDC_TOPOLOGY_EXTEND = 0x4, SDC_APPLY = 0x80, SDC_ALLOW_CHANGES = 0x400;
+    [DllImport("user32.dll")]
+    static extern int SetDisplayConfig(uint numPaths, byte[] paths, uint numModes, byte[] modes, uint flags);
+    [DllImport("user32.dll")]
+    static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
+    [DllImport("user32.dll")]
+    static extern int QueryDisplayConfig(uint flags, ref uint numPaths, byte[] paths, ref uint numModes, byte[] modes, IntPtr topologyId);
+
+    const uint SDC_TOPOLOGY_EXTEND = 0x4, SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x20, SDC_APPLY = 0x80,
+               SDC_SAVE_TO_DATABASE = 0x200, SDC_ALLOW_CHANGES = 0x400;
+    const uint QDC_ONLY_ACTIVE_PATHS = 0x2;
+    const int PATH_INFO_SIZE = 72, MODE_INFO_SIZE = 64;   // sizes of DISPLAYCONFIG_PATH_INFO / _MODE_INFO
+
+    /// <summary>Capture the exact active display configuration as Windows itself reports it.</summary>
+    public static TopologySnapshot CaptureTopology()
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            int r = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out uint np, out uint nm);
+            if (r != 0) throw new InvalidOperationException($"GetDisplayConfigBufferSizes failed ({r})");
+            var paths = new byte[np * PATH_INFO_SIZE];
+            var modes = new byte[nm * MODE_INFO_SIZE];
+            r = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref np, paths, ref nm, modes, IntPtr.Zero);
+            if (r == 122) continue;   // buffer too small: the layout changed between calls, try again
+            if (r != 0) throw new InvalidOperationException($"QueryDisplayConfig failed ({r})");
+            return new TopologySnapshot
+            {
+                PathCount = np,
+                ModeCount = nm,
+                Paths = Convert.ToBase64String(paths, 0, (int)(np * PATH_INFO_SIZE)),
+                Modes = Convert.ToBase64String(modes, 0, (int)(nm * MODE_INFO_SIZE))
+            };
+        }
+        throw new InvalidOperationException("Could not capture the display configuration");
+    }
+
+    public static void ApplyTopology(TopologySnapshot t)
+    {
+        var paths = Convert.FromBase64String(t.Paths);
+        var modes = Convert.FromBase64String(t.Modes);
+        int r = SetDisplayConfig(t.PathCount, paths, t.ModeCount, modes,
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES);
+        if (r != 0) throw new InvalidOperationException($"SetDisplayConfig failed (code {r})");
+    }
+
 
     const int ENUM_CURRENT_SETTINGS = -1, ENUM_REGISTRY_SETTINGS = -2;
     const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1, DISPLAY_DEVICE_PRIMARY_DEVICE = 0x4, DISPLAY_DEVICE_MIRRORING_DRIVER = 0x8;
@@ -307,26 +359,31 @@ static class Display
     }
 
     /// <summary>Put a previously saved layout back (re-enabling monitors that were switched off).</summary>
-    public static void Restore(List<MonInfo> layout)
+    public static void Restore(List<MonInfo> layout, TopologySnapshot topology)
     {
-        try
+        var errors = new List<string>();
+
+        // 1) Best: give Windows back the exact configuration captured before we changed anything
+        if (topology != null)
         {
-            RestoreCore(layout, false);
+            try { ApplyTopology(topology); Log.Write("Restored via saved display configuration"); return; }
+            catch (Exception ex) { errors.Add("saved configuration: " + ex.Message); Log.Write("Saved-configuration restore failed: " + ex.Message); }
         }
-        catch (Exception first)
+
+        // 2) Per-monitor restore from the saved numbers
+        try { RestoreCore(layout, false); Log.Write("Restored via per-monitor settings"); return; }
+        catch (Exception ex) { errors.Add("per-monitor: " + ex.Message); Log.Write("Per-monitor restore failed: " + ex.Message); }
+
+        // 3) Last resort: re-enable everything in Extend mode, then put positions back
+        int r = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_ALLOW_CHANGES);
+        Log.Write("SetDisplayConfig(extend) returned " + r);
+        Thread.Sleep(2000);
+        try { RestoreCore(layout, true); Log.Write("Restored via extend + reposition"); return; }
+        catch (Exception ex)
         {
-            Log.Write("Restore attempt 1 failed: " + first.Message + "  -> trying fallback (re-enable all monitors, then reposition)");
-            int r = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_ALLOW_CHANGES);
-            Log.Write("SetDisplayConfig(extend) returned " + r);
-            Thread.Sleep(2000);
-            try
-            {
-                RestoreCore(layout, true);
-            }
-            catch (Exception second)
-            {
-                throw new InvalidOperationException(first.Message + "  |  fallback: " + second.Message);
-            }
+            errors.Add("fallback: " + ex.Message);
+            throw new InvalidOperationException(string.Join("  |  ", errors) +
+                (r == 0 ? "  (your monitors were turned back on in Extend mode; arrange them in Windows Settings)" : ""));
         }
     }
 
@@ -402,7 +459,7 @@ class ConfirmForm : Form
 class MainForm : Form
 {
     const int WM_HOTKEY = 0x0312, HOTKEY_ID = 1;
-    const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2;
+    const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_SHIFT = 0x4;
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
     [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
@@ -418,6 +475,9 @@ class MainForm : Form
     readonly NotifyIcon tray = new();
     bool hotkeyOk;
     string lastRestoreError = "";
+    string hotkeyLabel = "Ctrl+Alt+M";
+    ToolStripItem restoreItem;
+    string HotkeyHint => hotkeyOk ? $" (or press {hotkeyLabel})" : "";
 
     public MainForm(AppConfig c, bool auto)
     {
@@ -479,7 +539,7 @@ class MainForm : Form
         var menu = new ContextMenuStrip();
         menu.Items.Add("Show window", null, (_, _) => ShowFromTray());
         menu.Items.Add("Switch to default monitor", null, (_, _) => ApplyDefault());
-        menu.Items.Add("Restore previous setup  (Ctrl+Alt+M)", null, (_, _) => HotkeyRestore());
+        restoreItem = menu.Items.Add("Restore previous setup", null, (_, _) => HotkeyRestore());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit (restores previous setup)", null, (_, _) => Close());
         tray.ContextMenuStrip = menu;
@@ -508,7 +568,7 @@ class MainForm : Form
 
         if (autoArg || cfg.AutoApplyOnLaunch)
         {
-            if (ApplyDefault()) HideToTray("Switched. Close this app (or press Ctrl+Alt+M) to restore your setup.");
+            if (ApplyDefault()) HideToTray("Switched. Close this app" + HotkeyHint + " to restore your setup.");
         }
     }
 
@@ -555,6 +615,8 @@ class MainForm : Form
             if (firstSwitch)
             {
                 cfg.SavedLayout = current;   // snapshot ONLY the first time, so we always return to the true original
+                try { cfg.SavedTopology = Display.CaptureTopology(); }
+                catch (Exception ex) { cfg.SavedTopology = null; Log.Write("Could not capture display configuration: " + ex.Message); }
                 cfg.Switched = true;
                 cfg.Save();
             }
@@ -566,7 +628,7 @@ class MainForm : Form
             Log.Write("Apply failed: " + ex);
             if (firstSwitch)
             {
-                try { Display.Restore(cfg.SavedLayout); } catch (Exception ex2) { Log.Write("Rollback failed: " + ex2.Message); }
+                try { Display.Restore(cfg.SavedLayout, cfg.SavedTopology); } catch (Exception ex2) { Log.Write("Rollback failed: " + ex2.Message); }
                 cfg.Switched = false;
                 cfg.Save();
             }
@@ -600,7 +662,7 @@ class MainForm : Form
         }
         try
         {
-            Display.Restore(cfg.SavedLayout);
+            Display.Restore(cfg.SavedLayout, cfg.SavedTopology);
             cfg.Switched = false;
             cfg.Save();
             Log.Write("Original layout restored");
@@ -653,9 +715,9 @@ class MainForm : Form
             lv.Items.Add(it);
         }
         lblStatus.Text = cfg.Switched
-            ? "ACTIVE: display layout is switched. Close this app (or press Ctrl+Alt+M) to restore your original setup."
+            ? "ACTIVE: display layout is switched. Close this app" + HotkeyHint + " to restore your original setup."
             : "Idle: your layout is unchanged.";
-        if (!hotkeyOk) lblStatus.Text += "  (Hotkey Ctrl+Alt+M is unavailable: another app uses it.)";
+        if (!hotkeyOk) lblStatus.Text += "  (No restore hotkey available: other apps use the shortcuts.)";
     }
 
     void HideToTray(string message)
@@ -676,8 +738,16 @@ class MainForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        hotkeyLabel = "Ctrl+Alt+M";
         hotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, (uint)Keys.M);
-        if (!hotkeyOk) Log.Write("Could not register Ctrl+Alt+M");
+        if (!hotkeyOk)
+        {
+            Log.Write("Could not register Ctrl+Alt+M (in use by another app); trying Ctrl+Alt+Shift+M");
+            hotkeyLabel = "Ctrl+Alt+Shift+M";
+            hotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_SHIFT, (uint)Keys.M);
+        }
+        if (!hotkeyOk) Log.Write("Could not register a restore hotkey");
+        else if (restoreItem != null) restoreItem.Text = $"Restore previous setup  ({hotkeyLabel})";
     }
 
     protected override void OnHandleDestroyed(EventArgs e)
