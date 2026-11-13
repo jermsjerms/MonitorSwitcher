@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Win32;
@@ -88,7 +89,9 @@ class MonInfo
     }
 
     [JsonIgnore]
-    public string Label => HwCode.Length > 0 ? $"{Name} [{HwCode}]" : Name;
+    public string Label => Name.StartsWith("Generic", StringComparison.OrdinalIgnoreCase) && HwCode.Length > 0
+        ? $"{Name} [{HwCode}]"
+        : Name;
 }
 
 class TopologySnapshot
@@ -286,7 +289,80 @@ static class Display
             int n = 1;
             foreach (var mon in g) { if (n > 1) mon.Key += "#" + n; n++; }
         }
+
+        ApplyFriendlyNames(list);
         return list;
+    }
+
+    // ── Friendly monitor names (brand + model, read from the monitor's EDID via Windows) ──
+    [DllImport("user32.dll")]
+    static extern int DisplayConfigGetDeviceInfo(byte[] packet);
+
+    static readonly Dictionary<string, string> Brands = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["DEL"] = "Dell", ["GSM"] = "LG", ["LGD"] = "LG", ["SAM"] = "Samsung", ["ACR"] = "Acer",
+        ["AUS"] = "ASUS", ["BNQ"] = "BenQ", ["HPN"] = "HP", ["HWP"] = "HP", ["LEN"] = "Lenovo",
+        ["MSI"] = "MSI", ["GBT"] = "Gigabyte", ["SNY"] = "Sony", ["PHL"] = "Philips",
+        ["VSC"] = "ViewSonic", ["AOC"] = "AOC", ["NEC"] = "NEC", ["MEI"] = "Panasonic",
+        ["TSB"] = "Toshiba", ["SHP"] = "Sharp", ["IVM"] = "Iiyama", ["EIZ"] = "Eizo"
+    };
+
+    static byte[] Request(uint type, int size, byte[] src, int offset)
+    {
+        var buf = new byte[size];
+        BitConverter.GetBytes(type).CopyTo(buf, 0);
+        BitConverter.GetBytes((uint)size).CopyTo(buf, 4);
+        Array.Copy(src, offset, buf, 8, 8);        // adapter LUID
+        Array.Copy(src, offset + 8, buf, 16, 4);   // source/target id
+        return buf;
+    }
+
+    static string Str(byte[] b, int offset, int bytes)
+    {
+        var t = Encoding.Unicode.GetString(b, offset, bytes);
+        int z = t.IndexOf('\0');
+        return (z >= 0 ? t.Substring(0, z) : t).Trim();
+    }
+
+    static string PnpCode(ushort raw)
+    {
+        int v = ((raw & 0xFF) << 8) | (raw >> 8);   // the 3-letter code is stored byte-swapped
+        return new string(new[] { (char)(((v >> 10) & 0x1F) + 64), (char)(((v >> 5) & 0x1F) + 64), (char)((v & 0x1F) + 64) });
+    }
+
+    static void ApplyFriendlyNames(List<MonInfo> list)
+    {
+        try
+        {
+            if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out uint np, out uint nm) != 0) return;
+            var paths = new byte[np * PATH_INFO_SIZE];
+            var modes = new byte[nm * MODE_INFO_SIZE];
+            if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) return;
+
+            for (int i = 0; i < np; i++)
+            {
+                int b = i * PATH_INFO_SIZE;
+
+                var src = Request(1, 84, paths, b);            // GET_SOURCE_NAME -> "\\.\DISPLAYn"
+                if (DisplayConfigGetDeviceInfo(src) != 0) continue;
+                string gdi = Str(src, 20, 64);
+
+                var tgt = Request(2, 420, paths, b + 20);      // GET_TARGET_NAME -> EDID name
+                if (DisplayConfigGetDeviceInfo(tgt) != 0) continue;
+                string friendly = Str(tgt, 36, 128);
+                ushort manu = BitConverter.ToUInt16(tgt, 28);
+                ushort prod = BitConverter.ToUInt16(tgt, 30);
+
+                string code = PnpCode(manu);
+                string brand = Brands.TryGetValue(code, out var bn) ? bn : code;
+                string model = string.IsNullOrWhiteSpace(friendly) ? "Monitor " + prod.ToString("X4") : friendly;
+                string full = model.Contains(brand, StringComparison.OrdinalIgnoreCase) ? model : brand + " " + model;
+
+                var mon = list.FirstOrDefault(m => m.Adapter.Equals(gdi, StringComparison.OrdinalIgnoreCase));
+                if (mon != null) mon.Name = full;
+            }
+        }
+        catch (Exception ex) { Log.Write("Friendly names unavailable: " + ex.Message); }
     }
 
     static DEVMODE Build(MonInfo m, int x, int y)
@@ -416,6 +492,21 @@ static class Display
     }
 }
 
+// ───────────────────────────── App icon (embedded icon.ico) ─────────────────────────────
+static class AppIcon
+{
+    public static Icon Load(Size size)
+    {
+        try
+        {
+            using var s = typeof(AppIcon).Assembly.GetManifestResourceStream("icon.ico");
+            if (s != null) return new Icon(s, size);
+        }
+        catch { /* fall back to the stock icon */ }
+        return SystemIcons.Application;
+    }
+}
+
 // ───────────────────────────── "Keep these settings?" dialog ─────────────────────────────
 class ConfirmForm : Form
 {
@@ -473,6 +564,7 @@ class MainForm : Form
     readonly CheckBox chkConfirm = new() { Text = "Ask me to confirm changes (auto-reverts in 15 s)", AutoSize = true };
     readonly Label lblStatus = new() { AutoSize = true, Padding = new Padding(0, 8, 0, 0) };
     readonly NotifyIcon tray = new();
+    readonly FlowLayoutPanel bottom = new();
     bool hotkeyOk;
     string lastRestoreError = "";
     string hotkeyLabel = "Ctrl+Alt+M";
@@ -521,14 +613,11 @@ class MainForm : Form
         var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = true };
         buttons.Controls.AddRange(new Control[] { btnApply, btnDefault, btnRestore, btnRefresh });
 
-        var bottom = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Bottom,
-            AutoSize = true,
-            FlowDirection = FlowDirection.TopDown,
-            WrapContents = false,
-            Padding = new Padding(10)
-        };
+        bottom.Dock = DockStyle.Bottom;
+        bottom.AutoSize = true;
+        bottom.FlowDirection = FlowDirection.TopDown;
+        bottom.WrapContents = false;
+        bottom.Padding = new Padding(10);
         bottom.Controls.AddRange(new Control[] { chkOff, chkAuto, chkConfirm, buttons, lblStatus });
 
         Controls.Add(lv);
@@ -543,7 +632,8 @@ class MainForm : Form
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit (restores previous setup)", null, (_, _) => Close());
         tray.ContextMenuStrip = menu;
-        tray.Icon = SystemIcons.Application;
+        tray.Icon = AppIcon.Load(SystemInformation.SmallIconSize);
+        Icon = AppIcon.Load(SystemInformation.IconSize);
         tray.Text = "Monitor Switcher";
         tray.DoubleClick += (_, _) => ShowFromTray();
         tray.Visible = true;
@@ -557,6 +647,7 @@ class MainForm : Form
     void OnStartup()
     {
         RefreshList();
+        FitWindow();
 
         if (cfg.Switched)
         {
@@ -718,6 +809,23 @@ class MainForm : Form
             ? "ACTIVE: display layout is switched. Close this app" + HotkeyHint + " to restore your original setup."
             : "Idle: your layout is unchanged.";
         if (!hotkeyOk) lblStatus.Text += "  (No restore hotkey available: other apps use the shortcuts.)";
+
+        foreach (ColumnHeader c in lv.Columns) c.Width = -2;   // auto-size to the widest of header/content
+    }
+
+    // Size the window so every column and row is visible without dragging.
+    void FitWindow()
+    {
+        var wa = Screen.FromControl(this).WorkingArea;
+        int cols = lv.Columns.Cast<ColumnHeader>().Sum(c => c.Width);
+        int needW = Math.Max(cols + SystemInformation.VerticalScrollBarWidth + 30, 720);
+
+        int rowH = lv.Items.Count > 0 ? lv.Items[0].Bounds.Height : 20;
+        int headerH = lv.Items.Count > 0 ? lv.Items[0].Bounds.Top : 26;
+        int needH = headerH + Math.Max(lv.Items.Count, 3) * rowH + 16 + bottom.Height;
+
+        ClientSize = new Size(Math.Min(needW, wa.Width - 40), Math.Min(Math.Max(needH, 320), wa.Height - 60));
+        CenterToScreen();
     }
 
     void HideToTray(string message)
