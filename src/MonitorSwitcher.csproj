@@ -8,10 +8,9 @@
     <Nullable>disable</Nullable>
     <AssemblyName>MonitorSwitcher</AssemblyName>
     <RootNamespace>MonitorSwitcher</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <ApplicationIcon>icon.ico</ApplicationIcon>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
-    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
