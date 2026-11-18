@@ -6,6 +6,7 @@ using Microsoft.Win32;
 
 namespace MonitorSwitcher;
 
+// ───────────────────────────── Entry point ─────────────────────────────
 static class Program
 {
     [STAThread]
@@ -13,6 +14,7 @@ static class Program
     {
         ApplicationConfiguration.Initialize();
 
+        // --restore : put the saved layout back and exit (handy as a panic shortcut)
         if (args.Any(a => a.Equals("--restore", StringComparison.OrdinalIgnoreCase)))
         {
             var c = AppConfig.Load();
@@ -44,6 +46,7 @@ static class Program
     }
 }
 
+// ───────────────────────────── Logging ─────────────────────────────
 static class Log
 {
     public static void Write(string msg)
@@ -56,5 +59,1283 @@ static class Log
                 $"{DateTime.Now:HH:mm:ss}  {msg}{Environment.NewLine}");
         }
         catch { /* logging must never crash the app */ }
+    }
+}
+
+// ───────────────────────────── Config (config.json next to the exe) ─────────────────────────────
+class MonInfo
+{
+    public string Key { get; set; } = "";      // stable hardware-based ID
+    public string Name { get; set; } = "";
+    public string Adapter { get; set; } = "";  // e.g. \\.\DISPLAY1
+    public bool Attached { get; set; }
+    public bool Primary { get; set; }
+    public int X { get; set; }
+    public int Y { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public int Freq { get; set; }
+    public int Bits { get; set; }
+    public int Orientation { get; set; }
+
+    [JsonIgnore]
+    public string HwCode
+    {
+        get
+        {
+            var parts = Key.Split('\\');
+            return parts.Length > 1 && parts[0] == "MONITOR" ? parts[1] : "";
+        }
+    }
+
+    [JsonIgnore]
+    public string Label => Name.StartsWith("Generic", StringComparison.OrdinalIgnoreCase) && HwCode.Length > 0
+        ? $"{Name} [{HwCode}]"
+        : Name;
+}
+
+class TopologySnapshot
+{
+    public uint PathCount { get; set; }
+    public uint ModeCount { get; set; }
+    public string Paths { get; set; } = "";
+    public string Modes { get; set; } = "";
+}
+
+class AppConfig
+{
+    public string DefaultMonitorKey { get; set; } = "";
+    public bool TurnOffOthers { get; set; } = false;
+    public bool AutoApplyOnLaunch { get; set; } = false;
+    public bool ConfirmChanges { get; set; } = true;
+    public uint HotkeyMods { get; set; } = 0x3;               // Ctrl + Alt
+    public uint HotkeyKey { get; set; } = (uint)Keys.M;       // default restore hotkey: Ctrl+Alt+M
+
+    // Crash-safe state: the layout from before we switched anything
+    public bool Switched { get; set; } = false;
+    public List<MonInfo> SavedLayout { get; set; } = new();
+    public TopologySnapshot SavedTopology { get; set; }
+    public Dictionary<string, TopologySnapshot> OffTopologies { get; set; } = new();   // layout from just before a monitor was turned off
+
+    public static readonly string Dir = ResolveDir();
+    static string FilePath => Path.Combine(Dir, "config.json");
+
+    static string ResolveDir()
+    {
+        string d = Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
+        try
+        {
+            var t = Path.Combine(d, ".write_test");
+            File.WriteAllText(t, "x");
+            File.Delete(t);
+            return d;
+        }
+        catch
+        {
+            var a = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MonitorSwitcher");
+            Directory.CreateDirectory(a);
+            return a;
+        }
+    }
+
+    public static AppConfig Load()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+                return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(FilePath)) ?? new AppConfig();
+        }
+        catch (Exception ex) { Log.Write("Config load failed: " + ex.Message); }
+        return new AppConfig();
+    }
+
+    public void Save()
+    {
+        try { File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true })); }
+        catch (Exception ex) { Log.Write("Config save failed: " + ex.Message); }
+    }
+}
+
+// ───────────────────────────── Windows display API wrapper ─────────────────────────────
+static class Display
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DISPLAY_DEVICE
+    {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX, dmPositionY;
+        public uint dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency,
+                    dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2,
+                    dmPanningWidth, dmPanningHeight;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool EnumDisplayDevices(string device, uint index, ref DISPLAY_DEVICE dd, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int ChangeDisplaySettingsEx(string device, IntPtr dm, IntPtr hwnd, uint flags, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern int SetDisplayConfig(uint numPaths, IntPtr paths, uint numModes, IntPtr modes, uint flags);
+    [DllImport("user32.dll")]
+    static extern int SetDisplayConfig(uint numPaths, byte[] paths, uint numModes, byte[] modes, uint flags);
+    [DllImport("user32.dll")]
+    static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
+    [DllImport("user32.dll")]
+    static extern int QueryDisplayConfig(uint flags, ref uint numPaths, byte[] paths, ref uint numModes, byte[] modes, IntPtr topologyId);
+
+    const uint SDC_TOPOLOGY_EXTEND = 0x4, SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x20, SDC_APPLY = 0x80,
+               SDC_SAVE_TO_DATABASE = 0x200, SDC_ALLOW_CHANGES = 0x400;
+    const uint QDC_ALL_PATHS = 0x1, QDC_ONLY_ACTIVE_PATHS = 0x2;
+    const int PATH_INFO_SIZE = 72, MODE_INFO_SIZE = 64;   // sizes of DISPLAYCONFIG_PATH_INFO / _MODE_INFO
+
+    /// <summary>Capture the exact active display configuration as Windows itself reports it.</summary>
+    public static TopologySnapshot CaptureTopology()
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            int r = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out uint np, out uint nm);
+            if (r != 0) throw new InvalidOperationException($"GetDisplayConfigBufferSizes failed ({r})");
+            var paths = new byte[np * PATH_INFO_SIZE];
+            var modes = new byte[nm * MODE_INFO_SIZE];
+            r = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref np, paths, ref nm, modes, IntPtr.Zero);
+            if (r == 122) continue;   // buffer too small: the layout changed between calls, try again
+            if (r != 0) throw new InvalidOperationException($"QueryDisplayConfig failed ({r})");
+            return new TopologySnapshot
+            {
+                PathCount = np,
+                ModeCount = nm,
+                Paths = Convert.ToBase64String(paths, 0, (int)(np * PATH_INFO_SIZE)),
+                Modes = Convert.ToBase64String(modes, 0, (int)(nm * MODE_INFO_SIZE))
+            };
+        }
+        throw new InvalidOperationException("Could not capture the display configuration");
+    }
+
+    public static void ApplyTopology(TopologySnapshot t)
+    {
+        var paths = Convert.FromBase64String(t.Paths);
+        var modes = Convert.FromBase64String(t.Modes);
+        int r = SetDisplayConfig(t.PathCount, paths, t.ModeCount, modes,
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES);
+        if (r != 0) throw new InvalidOperationException($"SetDisplayConfig failed (code {r})");
+    }
+
+
+    const int ENUM_CURRENT_SETTINGS = -1, ENUM_REGISTRY_SETTINGS = -2;
+    const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1, DISPLAY_DEVICE_PRIMARY_DEVICE = 0x4, DISPLAY_DEVICE_MIRRORING_DRIVER = 0x8;
+    const uint DM_POSITION = 0x20, DM_DISPLAYORIENTATION = 0x80, DM_BITSPERPEL = 0x40000,
+               DM_PELSWIDTH = 0x80000, DM_PELSHEIGHT = 0x100000, DM_DISPLAYFREQUENCY = 0x400000;
+    const uint CDS_UPDATEREGISTRY = 0x1, CDS_SET_PRIMARY = 0x10, CDS_NORESET = 0x10000000;
+
+    static DISPLAY_DEVICE NewDev() => new DISPLAY_DEVICE { cb = Marshal.SizeOf<DISPLAY_DEVICE>() };
+    static DEVMODE NewMode() => new DEVMODE { dmSize = (ushort)Marshal.SizeOf<DEVMODE>() };
+
+    public static List<MonInfo> Enumerate()
+    {
+        var list = new List<MonInfo>();
+        for (uint i = 0; ; i++)
+        {
+            var a = NewDev();
+            if (!EnumDisplayDevices(null, i, ref a, 0)) break;
+            if ((a.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER) != 0) continue;
+            if ((a.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0) continue;   // turned-off monitors are added below
+
+            var m = NewDev();
+            bool hasMonitor = EnumDisplayDevices(a.DeviceName, 0, ref m, 0);
+            var dm = NewMode();
+            if (!EnumDisplaySettings(a.DeviceName, ENUM_CURRENT_SETTINGS, ref dm)) continue;
+
+            list.Add(new MonInfo
+            {
+                Key = hasMonitor ? m.DeviceID : a.DeviceName,
+                Name = hasMonitor ? m.DeviceString : a.DeviceString,
+                Adapter = a.DeviceName,
+                Attached = true,
+                Primary = (a.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0,
+                X = dm.dmPositionX,
+                Y = dm.dmPositionY,
+                Width = (int)dm.dmPelsWidth,
+                Height = (int)dm.dmPelsHeight,
+                Freq = (int)dm.dmDisplayFrequency,
+                Bits = (int)dm.dmBitsPerPel,
+                Orientation = (int)dm.dmDisplayOrientation
+            });
+        }
+
+        ApplyFriendlyNames(list);   // also switches each key to the monitor's unique device path
+
+        // Identical monitors can share the same ID: make keys unique (#2, #3 ...)
+        foreach (var g in list.GroupBy(x => x.Key).Where(g => g.Count() > 1))
+        {
+            int n = 1;
+            foreach (var mon in g) { if (n > 1) mon.Key += "#" + n; n++; }
+        }
+
+        AddInactiveMonitors(list);  // connected monitors that are currently switched off
+        return list;
+    }
+
+    // ── Friendly monitor names (brand + model, read from the monitor's EDID via Windows) ──
+    [DllImport("user32.dll")]
+    static extern int DisplayConfigGetDeviceInfo(byte[] packet);
+
+    static readonly Dictionary<string, string> Brands = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["DEL"] = "Dell", ["GSM"] = "LG", ["LGD"] = "LG", ["SAM"] = "Samsung", ["ACR"] = "Acer",
+        ["AUS"] = "ASUS", ["BNQ"] = "BenQ", ["HPN"] = "HP", ["HWP"] = "HP", ["LEN"] = "Lenovo",
+        ["MSI"] = "MSI", ["GBT"] = "Gigabyte", ["SNY"] = "Sony", ["PHL"] = "Philips",
+        ["VSC"] = "ViewSonic", ["AOC"] = "AOC", ["NEC"] = "NEC", ["MEI"] = "Panasonic",
+        ["TSB"] = "Toshiba", ["SHP"] = "Sharp", ["IVM"] = "Iiyama", ["EIZ"] = "Eizo"
+    };
+
+    static byte[] Request(uint type, int size, byte[] src, int offset)
+    {
+        var buf = new byte[size];
+        BitConverter.GetBytes(type).CopyTo(buf, 0);
+        BitConverter.GetBytes((uint)size).CopyTo(buf, 4);
+        Array.Copy(src, offset, buf, 8, 8);        // adapter LUID
+        Array.Copy(src, offset + 8, buf, 16, 4);   // source/target id
+        return buf;
+    }
+
+    static string Str(byte[] b, int offset, int bytes)
+    {
+        var t = Encoding.Unicode.GetString(b, offset, bytes);
+        int z = t.IndexOf('\0');
+        return (z >= 0 ? t.Substring(0, z) : t).Trim();
+    }
+
+    static string PnpCode(ushort raw)
+    {
+        int v = ((raw & 0xFF) << 8) | (raw >> 8);   // the 3-letter code is stored byte-swapped
+        return new string(new[] { (char)(((v >> 10) & 0x1F) + 64), (char)(((v >> 5) & 0x1F) + 64), (char)((v & 0x1F) + 64) });
+    }
+
+    // Reads brand/model and the unique device path of the monitor at the end of one display path.
+    static bool TargetInfo(byte[] paths, int pathOffset, out string devicePath, out string fullName)
+    {
+        devicePath = ""; fullName = "";
+        var tgt = Request(2, 420, paths, pathOffset + 20);     // GET_TARGET_NAME
+        if (DisplayConfigGetDeviceInfo(tgt) != 0) return false;
+
+        string friendly = Str(tgt, 36, 128);
+        ushort manu = BitConverter.ToUInt16(tgt, 28);
+        ushort prod = BitConverter.ToUInt16(tgt, 30);
+        devicePath = Str(tgt, 164, 256);
+
+        string code = PnpCode(manu);
+        string brand = Brands.TryGetValue(code, out var bn) ? bn : code;
+        string model = string.IsNullOrWhiteSpace(friendly) ? "Monitor " + prod.ToString("X4") : friendly;
+        fullName = model.Contains(brand, StringComparison.OrdinalIgnoreCase) ? model : brand + " " + model;
+        return true;
+    }
+
+    static bool QueryPaths(uint flags, out byte[] paths, out uint count)
+    {
+        paths = Array.Empty<byte>();
+        count = 0;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            if (GetDisplayConfigBufferSizes(flags, out uint np, out uint nm) != 0) return false;
+            var p = new byte[np * PATH_INFO_SIZE];
+            var md = new byte[nm * MODE_INFO_SIZE];
+            int r = QueryDisplayConfig(flags, ref np, p, ref nm, md, IntPtr.Zero);
+            if (r == 122) continue;   // buffer too small: layout changed in between, retry
+            if (r != 0) return false;
+            paths = p;
+            count = np;
+            return true;
+        }
+        return false;
+    }
+
+    static void ApplyFriendlyNames(List<MonInfo> list)
+    {
+        try
+        {
+            if (!QueryPaths(QDC_ONLY_ACTIVE_PATHS, out var paths, out uint np)) return;
+            for (int i = 0; i < np; i++)
+            {
+                int b = i * PATH_INFO_SIZE;
+
+                var src = Request(1, 84, paths, b);            // GET_SOURCE_NAME -> "\\.\DISPLAYn"
+                if (DisplayConfigGetDeviceInfo(src) != 0) continue;
+                string gdi = Str(src, 20, 64);
+
+                if (!TargetInfo(paths, b, out string devPath, out string full)) continue;
+
+                var mon = list.FirstOrDefault(m => m.Adapter.Equals(gdi, StringComparison.OrdinalIgnoreCase));
+                if (mon == null) continue;
+                mon.Name = full;
+                if (devPath.Length > 0) mon.Key = devPath;
+            }
+        }
+        catch (Exception ex) { Log.Write("Friendly names unavailable: " + ex.Message); }
+    }
+
+    // Monitors that are plugged in but currently switched off only show up in the "all paths" list.
+    static void AddInactiveMonitors(List<MonInfo> list)
+    {
+        try
+        {
+            // If we couldn't identify the active monitors by device path, we can't safely tell which ones are off.
+            if (list.Any(m => !m.Key.StartsWith(@"\\?\"))) return;
+            if (!QueryPaths(QDC_ALL_PATHS, out var paths, out uint np)) return;
+
+            var seen = new HashSet<string>(list.Select(m => m.Key), StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < np; i++)
+            {
+                int b = i * PATH_INFO_SIZE;
+                bool active = (BitConverter.ToUInt32(paths, b + 68) & 1) != 0;      // path flags
+                bool available = BitConverter.ToUInt32(paths, b + 60) != 0;         // targetAvailable
+                if (active || !available) continue;
+                if (!TargetInfo(paths, b, out string devPath, out string full) || devPath.Length == 0) continue;
+                if (!seen.Add(devPath)) continue;
+
+                list.Add(new MonInfo { Key = devPath, Name = full, Adapter = "", Attached = false });
+            }
+        }
+        catch (Exception ex) { Log.Write("Could not list turned-off monitors: " + ex.Message); }
+    }
+
+    /// <summary>Turn one active monitor off (detach it from the desktop).</summary>
+    public static void DisableMonitor(MonInfo m)
+    {
+        if (!m.Attached || string.IsNullOrEmpty(m.Adapter))
+            throw new InvalidOperationException("That monitor is already off.");
+        var off = NewMode();
+        off.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;   // 0x0 size = detach
+        Commit(new List<(string, DEVMODE, uint)> { (m.Adapter, off, CDS_UPDATEREGISTRY | CDS_NORESET) });
+    }
+
+    public static string DescribeList(List<MonInfo> list) =>
+        string.Join(" | ", list.Select(m => $"{m.Name} [{(m.Attached ? "on" : "off")}] {m.Key}"));
+
+    // Waits (up to timeoutMs) for the wanted monitor to show up as active.
+    static List<MonInfo> WaitForMonitor(Func<MonInfo, bool> isTarget, int timeoutMs)
+    {
+        long end = Environment.TickCount64 + timeoutMs;
+        while (true)
+        {
+            Thread.Sleep(700);
+            var list = Enumerate();
+            if (list.Any(isTarget)) return list;
+            if (Environment.TickCount64 >= end) return null;
+        }
+    }
+
+    /// <summary>
+    /// Turn one switched-off monitor on and return it. Tries, in order: the layout saved from just before it was
+    /// turned off, any other saved layout, then Windows' own "Extend". Any other monitor that comes on as a side
+    /// effect is switched off again, and the primary monitor is put back.
+    /// </summary>
+    public static MonInfo EnableMonitor(MonInfo target, List<MonInfo> before, IEnumerable<TopologySnapshot> hints)
+    {
+        var wasActiveKeys = new HashSet<string>(before.Where(b => b.Attached).Select(b => b.Key), StringComparer.OrdinalIgnoreCase);
+        var wasActiveNames = new HashSet<string>(before.Where(b => b.Attached).Select(b => b.Name), StringComparer.OrdinalIgnoreCase);
+        string primaryKey = before.FirstOrDefault(b => b.Primary)?.Key;
+
+        // The wanted monitor: same key, or (if the key came out differently) same name as a monitor that was not on before
+        bool IsTarget(MonInfo m) => m.Attached &&
+            (string.Equals(m.Key, target.Key, StringComparison.OrdinalIgnoreCase) ||
+             (string.Equals(m.Name, target.Name, StringComparison.OrdinalIgnoreCase) && !wasActiveNames.Contains(m.Name)));
+
+        var attempts = new List<(string name, Action run)>();
+        int n = 0;
+        foreach (var h in hints.Where(h => h != null))
+        {
+            var snap = h;
+            attempts.Add(($"saved configuration {++n}", () => ApplyTopology(snap)));
+        }
+        attempts.Add(("extend", () =>
+        {
+            int r = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+            Log.Write("SetDisplayConfig(extend) returned " + r);
+            if (r != 0) throw new InvalidOperationException($"error code {r}");
+        }));
+
+        List<MonInfo> after = null;
+        var errors = new List<string>();
+        foreach (var (name, run) in attempts)
+        {
+            try { run(); }
+            catch (Exception ex)
+            {
+                errors.Add($"{name}: {ex.Message}");
+                Log.Write($"Turn-on attempt '{name}' failed: {ex.Message}");
+                continue;
+            }
+
+            after = WaitForMonitor(IsTarget, 8000);
+            if (after != null) { Log.Write($"Monitor came on via '{name}'"); break; }
+            Log.Write($"Monitor still off after '{name}'. Monitors now: " + DescribeList(Enumerate()));
+            errors.Add($"{name}: no effect");
+        }
+
+        if (after == null)
+            throw new InvalidOperationException("Windows did not turn the monitor on. Check that it is powered on and set to the right input " +
+                "(for a TV, the right HDMI input). Details: " + string.Join("; ", errors));
+
+        var turnedOn = after.First(IsTarget);
+
+        // Switch back off anything else that Windows turned on along the way
+        foreach (var x in after.Where(x => x.Attached && !IsTarget(x) && !wasActiveKeys.Contains(x.Key)).ToList())
+            DisableMonitor(x);
+
+        // Keep the same primary monitor as before
+        if (primaryKey != null)
+        {
+            after = Enumerate();
+            var p = after.FirstOrDefault(x => x.Attached && string.Equals(x.Key, primaryKey, StringComparison.OrdinalIgnoreCase));
+            if (p != null && !p.Primary) SetPrimary(p, after, false);
+        }
+        return turnedOn;
+    }
+
+    static DEVMODE Build(MonInfo m, int x, int y)
+    {
+        var dm = NewMode();
+        dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
+        dm.dmPositionX = x;
+        dm.dmPositionY = y;
+        dm.dmPelsWidth = (uint)m.Width;
+        dm.dmPelsHeight = (uint)m.Height;
+        dm.dmBitsPerPel = (uint)(m.Bits > 0 ? m.Bits : 32);
+        dm.dmDisplayFrequency = (uint)m.Freq;
+        dm.dmDisplayOrientation = (uint)m.Orientation;
+        return dm;
+    }
+
+    static string Describe(int r) => r switch
+    {
+        1 => "A restart is required for the change to take effect",
+        -1 => "The display driver failed the request",
+        -2 => "The requested mode is not supported",
+        -3 => "Settings could not be written to the registry",
+        -4 => "Bad flags",
+        -5 => "Bad parameter",
+        _ => $"Error code {r}"
+    };
+
+    static void Commit(List<(string adapter, DEVMODE dm, uint flags)> plan)
+    {
+        foreach (var p in plan)
+        {
+            var dm = p.dm;
+            int r = ChangeDisplaySettingsEx(p.adapter, ref dm, IntPtr.Zero, p.flags, IntPtr.Zero);
+            if (r == -2 && dm.dmPelsWidth != 0)   // BADMODE: retry with only position + resolution
+            {
+                Log.Write($"{p.adapter}: full mode rejected, retrying with position + resolution only");
+                dm.dmFields &= ~(DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION);
+                r = ChangeDisplaySettingsEx(p.adapter, ref dm, IntPtr.Zero, p.flags, IntPtr.Zero);
+            }
+            if (r != 0) throw new InvalidOperationException($"{p.adapter}: {Describe(r)}");
+        }
+        int final = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        if (final != 0) throw new InvalidOperationException(Describe(final));
+    }
+
+    /// <summary>Make <paramref name="target"/> the primary display (re-positioning the others around it).</summary>
+    public static void SetPrimary(MonInfo target, List<MonInfo> current, bool disableOthers)
+    {
+        int ox = target.X, oy = target.Y;
+        const uint baseFlags = CDS_UPDATEREGISTRY | CDS_NORESET;
+        var plan = new List<(string, DEVMODE, uint)>
+        {
+            (target.Adapter, Build(target, 0, 0), baseFlags | CDS_SET_PRIMARY)
+        };
+
+        foreach (var o in current.Where(o => o.Attached && o.Adapter != target.Adapter))
+        {
+            if (disableOthers)
+            {
+                var off = NewMode();
+                off.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;   // 0x0 size = detach
+                plan.Add((o.Adapter, off, baseFlags));
+            }
+            else
+            {
+                plan.Add((o.Adapter, Build(o, o.X - ox, o.Y - oy), baseFlags));
+            }
+        }
+        Commit(plan);
+    }
+
+    /// <summary>Put a previously saved layout back (re-enabling monitors that were switched off).</summary>
+    public static void Restore(List<MonInfo> layout, TopologySnapshot topology)
+    {
+        var errors = new List<string>();
+
+        // 1) Best: give Windows back the exact configuration captured before we changed anything
+        if (topology != null)
+        {
+            try { ApplyTopology(topology); Log.Write("Restored via saved display configuration"); return; }
+            catch (Exception ex) { errors.Add("saved configuration: " + ex.Message); Log.Write("Saved-configuration restore failed: " + ex.Message); }
+        }
+
+        // 2) Per-monitor restore from the saved numbers
+        try { RestoreCore(layout, false); Log.Write("Restored via per-monitor settings"); return; }
+        catch (Exception ex) { errors.Add("per-monitor: " + ex.Message); Log.Write("Per-monitor restore failed: " + ex.Message); }
+
+        // 3) Last resort: re-enable everything in Extend mode, then put positions back
+        int r = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_ALLOW_CHANGES);
+        Log.Write("SetDisplayConfig(extend) returned " + r);
+        Thread.Sleep(2000);
+        try { RestoreCore(layout, true); Log.Write("Restored via extend + reposition"); return; }
+        catch (Exception ex)
+        {
+            errors.Add("fallback: " + ex.Message);
+            throw new InvalidOperationException(string.Join("  |  ", errors) +
+                (r == 0 ? "  (your monitors were turned back on in Extend mode; arrange them in Windows Settings)" : ""));
+        }
+    }
+
+    // useCurrentModes: keep whatever resolution/refresh each monitor is running right now and only
+    // put the saved positions + primary flag back (monitors matched by hardware key).
+    static void RestoreCore(List<MonInfo> layout, bool useCurrentModes)
+    {
+        const uint baseFlags = CDS_UPDATEREGISTRY | CDS_NORESET;
+        var attached = layout.Where(m => m.Attached).ToList();
+        var primary = attached.FirstOrDefault(m => m.Primary) ?? attached.FirstOrDefault();
+        if (primary == null) return;
+
+        var current = useCurrentModes ? Enumerate() : null;
+        (string, DEVMODE, uint) Entry(MonInfo m, uint flags)
+        {
+            var src = m;
+            if (current != null)
+            {
+                var cur = current.FirstOrDefault(c => c.Key == m.Key && c.Attached);
+                if (cur != null) src = cur;
+            }
+            var dm = Build(src, m.X, m.Y);
+            return (src.Adapter, dm, flags);
+        }
+
+        var plan = new List<(string, DEVMODE, uint)> { Entry(primary, baseFlags | CDS_SET_PRIMARY) };
+        foreach (var m in attached.Where(m => m != primary))
+            plan.Add(Entry(m, baseFlags));
+        Commit(plan);
+    }
+}
+
+// ───────────────────────────── App icon (embedded icon.ico) ─────────────────────────────
+static class AppIcon
+{
+    public static Icon Load(Size size)
+    {
+        try
+        {
+            using var s = typeof(AppIcon).Assembly.GetManifestResourceStream("icon.ico");
+            if (s != null) return new Icon(s, size);
+        }
+        catch { /* fall back to the stock icon */ }
+        return SystemIcons.Application;
+    }
+}
+
+// ───────────────────────────── "Keep these settings?" dialog ─────────────────────────────
+class ConfirmForm : Form
+{
+    int left;
+    readonly Label lbl = new() { AutoSize = true, MaximumSize = new Size(440, 0) };
+    readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
+
+    public ConfirmForm(int seconds)
+    {
+        left = seconds;
+        Text = "Keep display settings?";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterScreen;
+        TopMost = true;
+        ControlBox = false;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
+
+        // Size everything from its content so nothing is cut off at any display scaling
+        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoSize = true;
+        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        Padding = new Padding(18, 16, 18, 16);
+
+        UpdateText();
+
+        var keep = new Button { Text = "Keep", DialogResult = DialogResult.Yes, AutoSize = true, Padding = new Padding(16, 3, 16, 3), Margin = new Padding(6, 0, 6, 0) };
+        var revert = new Button { Text = "Revert", DialogResult = DialogResult.No, AutoSize = true, Padding = new Padding(16, 3, 16, 3), Margin = new Padding(6, 0, 6, 0) };
+        var buttons = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Anchor = AnchorStyles.None,
+            Margin = new Padding(0, 14, 0, 0)
+        };
+        buttons.Controls.AddRange(new Control[] { keep, revert });
+
+        var layout = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = 2 };
+        layout.Controls.Add(lbl, 0, 0);
+        layout.Controls.Add(buttons, 0, 1);
+        Controls.Add(layout);
+        AcceptButton = keep;
+
+        timer.Tick += (_, _) =>
+        {
+            left--;
+            if (left <= 0) { timer.Stop(); DialogResult = DialogResult.No; }
+            else UpdateText();
+        };
+        Load += (_, _) => CenterToScreen();
+        Shown += (_, _) => timer.Start();
+        FormClosed += (_, _) => timer.Dispose();
+    }
+
+    void UpdateText() => lbl.Text = $"Your display layout was changed.\nReverting automatically in {left} seconds unless you keep it.";
+}
+
+// ───────────────────────────── Hotkey helpers + "press your shortcut" dialog ─────────────────────────────
+static class HotkeyInfo
+{
+    public const uint ALT = 0x1, CTRL = 0x2, SHIFT = 0x4;
+
+    public static string Text(uint mods, uint key)
+    {
+        var parts = new List<string>();
+        if ((mods & CTRL) != 0) parts.Add("Ctrl");
+        if ((mods & ALT) != 0) parts.Add("Alt");
+        if ((mods & SHIFT) != 0) parts.Add("Shift");
+        var k = (Keys)key;
+        parts.Add(k >= Keys.D0 && k <= Keys.D9 ? ((char)k).ToString() : k.ToString());
+        return string.Join("+", parts);
+    }
+}
+
+class HotkeyForm : Form
+{
+    public uint Mods { get; private set; }
+    public uint Key { get; private set; }
+    readonly Label combo = new();
+
+    public HotkeyForm(uint mods, uint key)
+    {
+        Mods = mods;
+        Key = key;
+        Text = "Restore hotkey";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterParent;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
+
+        // Size everything from its content so nothing is cut off at any display scaling
+        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoSize = true;
+        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        Padding = new Padding(16);
+
+        var info = new Label
+        {
+            Text = "Press the keys you want to use to restore your setup.\nHold Ctrl and/or Alt, then press a letter, number or F-key.",
+            AutoSize = true,
+            MaximumSize = new Size(380, 0),
+            Margin = new Padding(0, 0, 0, 10)
+        };
+        combo.AutoSize = true;
+        combo.BorderStyle = BorderStyle.FixedSingle;
+        combo.TextAlign = ContentAlignment.MiddleCenter;
+        combo.Padding = new Padding(10);
+        combo.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+        combo.Margin = new Padding(0, 0, 0, 10);
+        combo.Font = new Font(Font.FontFamily, 12f, FontStyle.Bold);
+        var hint = new Label { Text = "Tip: avoid shortcuts used by your games or other apps.", AutoSize = true, Margin = new Padding(0, 0, 0, 14) };
+
+        var reset = new Button { Text = "Default (Ctrl+Alt+M)", AutoSize = true, Margin = new Padding(0, 0, 30, 0) };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true, Padding = new Padding(14, 2, 14, 2) };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+        reset.Click += (_, _) => { Mods = HotkeyInfo.CTRL | HotkeyInfo.ALT; Key = (uint)Keys.M; UpdateText(); };
+
+        var buttons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.LeftToRight, Anchor = AnchorStyles.Right };
+        buttons.Controls.AddRange(new Control[] { reset, ok, cancel });
+
+        var layout = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = 4 };
+        layout.Controls.Add(info, 0, 0);
+        layout.Controls.Add(combo, 0, 1);
+        layout.Controls.Add(hint, 0, 2);
+        layout.Controls.Add(buttons, 0, 3);
+        Controls.Add(layout);
+
+        AcceptButton = ok;
+        CancelButton = cancel;
+        UpdateText();
+    }
+
+    void UpdateText() => combo.Text = HotkeyInfo.Text(Mods, Key);
+
+    // Catch the key combination before the dialog's own buttons can react to it
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        Keys key = keyData & Keys.KeyCode;
+        uint mods = 0;
+        if ((keyData & Keys.Control) != 0) mods |= HotkeyInfo.CTRL;
+        if ((keyData & Keys.Alt) != 0) mods |= HotkeyInfo.ALT;
+        if ((keyData & Keys.Shift) != 0) mods |= HotkeyInfo.SHIFT;
+
+        if (key == Keys.ControlKey || key == Keys.ShiftKey || key == Keys.Menu) return true;   // a modifier on its own
+        if ((mods & (HotkeyInfo.CTRL | HotkeyInfo.ALT)) == 0)
+            return base.ProcessCmdKey(ref msg, keyData);   // needs Ctrl or Alt; let Esc / Enter / Tab work normally
+
+        Mods = mods;
+        Key = (uint)key;
+        UpdateText();
+        return true;
+    }
+}
+
+// ───────────────────────────── Main window ─────────────────────────────
+class MainForm : Form
+{
+    const int WM_HOTKEY = 0x0312, HOTKEY_ID = 1;
+    const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_SHIFT = 0x4, MOD_NOREPEAT = 0x4000;
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    readonly AppConfig cfg;
+    readonly bool autoArg;
+    List<MonInfo> monitors = new();
+
+    readonly ListView lv = new();
+    readonly CheckBox chkOff = new() { Text = "Turn off other monitors while active", AutoSize = true };
+    readonly CheckBox chkAuto = new() { Text = "Apply default monitor automatically when app opens", AutoSize = true };
+    readonly CheckBox chkConfirm = new() { Text = "Ask me to confirm changes (auto-reverts in 15 s)", AutoSize = true };
+    readonly Label lblStatus = new() { AutoSize = true, Padding = new Padding(0, 8, 0, 0) };
+    readonly Button btnToggle = new() { Text = "Turn selected monitor off", AutoSize = true };
+    readonly Label lblHotkey = new() { Text = "Restore hotkey: Ctrl+Alt+M", AutoSize = true, Margin = new Padding(3, 7, 8, 0) };
+    readonly Button btnHotkey = new() { Text = "Change...", AutoSize = true };
+    readonly NotifyIcon tray = new();
+    readonly FlowLayoutPanel bottom = new();
+    bool hotkeyOk;
+    string lastRestoreError = "";
+    string hotkeyLabel = "Ctrl+Alt+M";
+    ToolStripItem restoreItem;
+    string HotkeyHint => hotkeyOk ? $" (or press {hotkeyLabel})" : "";
+
+    public MainForm(AppConfig c, bool auto)
+    {
+        cfg = c;
+        autoArg = auto;
+
+        Text = "Monitor Switcher";
+        ClientSize = new Size(860, 480);
+        MinimumSize = new Size(780, 420);
+        StartPosition = FormStartPosition.CenterScreen;
+
+        lv.Dock = DockStyle.Fill;
+        lv.View = View.Details;
+        lv.FullRowSelect = true;
+        lv.MultiSelect = false;
+        lv.HideSelection = false;
+        lv.GridLines = true;
+        lv.Columns.Add("Monitor", 270);
+        lv.Columns.Add("Display", 80);
+        lv.Columns.Add("Resolution", 100);
+        lv.Columns.Add("Refresh", 70);
+        lv.Columns.Add("Position", 90);
+        lv.Columns.Add("Status", 160);
+
+        chkOff.Checked = cfg.TurnOffOthers;
+        chkAuto.Checked = cfg.AutoApplyOnLaunch;
+        chkConfirm.Checked = cfg.ConfirmChanges;
+        chkOff.CheckedChanged += (_, _) => { cfg.TurnOffOthers = chkOff.Checked; cfg.Save(); };
+        chkAuto.CheckedChanged += (_, _) => { cfg.AutoApplyOnLaunch = chkAuto.Checked; cfg.Save(); };
+        chkConfirm.CheckedChanged += (_, _) => { cfg.ConfirmChanges = chkConfirm.Checked; cfg.Save(); };
+
+        var btnApply = new Button { Text = "Switch to selected monitor", AutoSize = true };
+        var btnDefault = new Button { Text = "Set selected as default", AutoSize = true };
+        var btnRestore = new Button { Text = "Restore previous setup", AutoSize = true };
+        var btnRefresh = new Button { Text = "Refresh", AutoSize = true };
+        btnApply.Click += (_, _) => OnApplyClicked();
+        btnToggle.Click += (_, _) => OnToggleClicked();
+        btnDefault.Click += (_, _) => OnSetDefault();
+        btnRestore.Click += (_, _) => { if (RestoreLayout(false)) RefreshList(); };
+        btnRefresh.Click += (_, _) => RefreshList();
+
+        var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = true };
+        buttons.Controls.AddRange(new Control[] { btnApply, btnToggle, btnDefault, btnRestore, btnRefresh });
+
+        bottom.Dock = DockStyle.Bottom;
+        bottom.AutoSize = true;
+        bottom.FlowDirection = FlowDirection.TopDown;
+        bottom.WrapContents = false;
+        bottom.Padding = new Padding(10);
+        var hotkeyRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        hotkeyRow.Controls.AddRange(new Control[] { lblHotkey, btnHotkey });
+        btnHotkey.Click += (_, _) => OnChangeHotkey();
+
+        bottom.Controls.AddRange(new Control[] { chkOff, chkAuto, chkConfirm, hotkeyRow, buttons, lblStatus });
+
+        // Right-click menu on the monitor list
+        var ctx = new ContextMenuStrip();
+        var miToggle = ctx.Items.Add("Turn off this monitor", null, (_, _) => OnToggleClicked());
+        ctx.Items.Add("Make primary (switch to this monitor)", null, (_, _) => OnApplyClicked());
+        ctx.Items.Add("Set as default", null, (_, _) => OnSetDefault());
+        ctx.Opening += (_, e) =>
+        {
+            var sel = SelectedMonitor();
+            if (sel == null) { e.Cancel = true; return; }
+            miToggle.Text = sel.Attached ? "Turn off this monitor" : "Turn on this monitor";
+        };
+        lv.ContextMenuStrip = ctx;
+        lv.MouseDown += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            var hit = lv.GetItemAt(e.X, e.Y);
+            if (hit != null) { lv.SelectedItems.Clear(); hit.Selected = true; }
+        };
+        lv.SelectedIndexChanged += (_, _) => UpdateToggleButton();
+
+        Controls.Add(lv);
+        Controls.Add(bottom);
+        lv.BringToFront();
+
+        // Tray icon
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Show window", null, (_, _) => ShowFromTray());
+        menu.Items.Add("Switch to default monitor", null, (_, _) => ApplyDefault());
+        restoreItem = menu.Items.Add("Restore previous setup", null, (_, _) => HotkeyRestore());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Exit (restores previous setup)", null, (_, _) => Close());
+        tray.ContextMenuStrip = menu;
+        tray.Icon = AppIcon.Load(SystemInformation.SmallIconSize);
+        Icon = AppIcon.Load(SystemInformation.IconSize);
+        tray.Text = "Monitor Switcher";
+        tray.DoubleClick += (_, _) => ShowFromTray();
+        tray.Visible = true;
+
+        Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) Hide(); };
+        Shown += (_, _) => OnStartup();
+        SystemEvents.SessionEnding += (_, _) => RestoreLayout(true);
+    }
+
+    // ── Startup ──
+    void OnStartup()
+    {
+        RefreshList();
+        FitWindow();
+
+        if (cfg.Switched)
+        {
+            var r = MessageBox.Show(this,
+                "Last time, Monitor Switcher did not get to restore your original display layout.\n\nRestore it now?",
+                "Monitor Switcher", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r == DialogResult.Yes) { RestoreLayout(false); RefreshList(); }
+        }
+
+        if (autoArg || cfg.AutoApplyOnLaunch)
+        {
+            if (ApplyDefault()) HideToTray("Switched. Close this app" + HotkeyHint + " to restore your setup.");
+        }
+    }
+
+    // ── Actions ──
+    MonInfo SelectedOrDefault() =>
+        lv.SelectedItems.Count > 0
+            ? (MonInfo)lv.SelectedItems[0].Tag
+            : monitors.FirstOrDefault(m => m.Key == cfg.DefaultMonitorKey);
+
+    void OnApplyClicked()
+    {
+        var t = SelectedOrDefault();
+        if (t == null) { MessageBox.Show(this, "Select a monitor in the list first.", "Monitor Switcher"); return; }
+        ApplySwitch(t);
+    }
+
+    void OnSetDefault()
+    {
+        if (lv.SelectedItems.Count == 0) { MessageBox.Show(this, "Select a monitor in the list first.", "Monitor Switcher"); return; }
+        cfg.DefaultMonitorKey = ((MonInfo)lv.SelectedItems[0].Tag).Key;
+        cfg.Save();
+        RefreshList();
+    }
+
+    MonInfo SelectedMonitor() =>
+        lv.SelectedItems.Count > 0 ? (MonInfo)lv.SelectedItems[0].Tag : null;
+
+    void UpdateToggleButton()
+    {
+        var m = SelectedMonitor();
+        btnToggle.Text = m != null && !m.Attached ? "Turn selected monitor on" : "Turn selected monitor off";
+    }
+
+    void OnToggleClicked()
+    {
+        var m = SelectedMonitor();
+        if (m == null) { MessageBox.Show(this, "Select a monitor in the list first.", "Monitor Switcher"); return; }
+        ToggleMonitor(m);
+    }
+
+    bool ToggleMonitor(MonInfo m)
+    {
+        bool turningOff = m.Attached;
+        var current = Display.Enumerate();
+        Log.Write("Monitors: " + Display.DescribeList(current));
+
+        if (turningOff)
+        {
+            if (current.Count(x => x.Attached) <= 1)
+            {
+                MessageBox.Show(this, "This is the only active monitor, so it can't be turned off.", "Monitor Switcher");
+                return false;
+            }
+            if (m.Primary)
+            {
+                MessageBox.Show(this, "This is your primary monitor. Make another monitor primary first " +
+                    "(right-click it, then Make primary), then turn this one off.", "Monitor Switcher");
+                return false;
+            }
+        }
+
+        bool firstChange = !cfg.Switched;
+        TopologySnapshot before = null;
+        try
+        {
+            if (firstChange)
+            {
+                cfg.SavedLayout = current;   // snapshot ONLY the first time, so we always return to the true original
+                try { cfg.SavedTopology = Display.CaptureTopology(); }
+                catch (Exception ex) { cfg.SavedTopology = null; Log.Write("Could not capture display configuration: " + ex.Message); }
+                cfg.Switched = true;
+                cfg.Save();
+            }
+            try { before = Display.CaptureTopology(); }
+            catch (Exception ex) { Log.Write("Could not capture state for undo: " + ex.Message); }
+
+            if (turningOff)
+            {
+                Display.DisableMonitor(m);
+                if (before != null) { cfg.OffTopologies[m.Key] = before; cfg.Save(); }
+            }
+            else
+            {
+                Display.EnableMonitor(m, current,
+                    new[] { cfg.OffTopologies.GetValueOrDefault(m.Key), firstChange ? null : cfg.SavedTopology });
+                cfg.OffTopologies.Remove(m.Key);
+                cfg.Save();
+            }
+            Log.Write((turningOff ? "Turned off " : "Turned on ") + m.Label);
+        }
+        catch (Exception ex)
+        {
+            Log.Write("Toggle failed: " + ex);
+            try { if (before != null) Display.ApplyTopology(before); }
+            catch (Exception ex2) { Log.Write("Undo failed: " + ex2.Message); }
+            if (firstChange) { cfg.Switched = false; cfg.Save(); }
+            RefreshList();
+            MessageBox.Show(this, "Could not turn the monitor " + (turningOff ? "off" : "on") + ":\n" + ex.Message +
+                "\n\nTip: check the log file in the 'logs' folder.", "Monitor Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+
+        RefreshList();
+
+        if (cfg.ConfirmChanges)
+        {
+            using var dlg = new ConfirmForm(15);
+            if (dlg.ShowDialog() != DialogResult.Yes)
+            {
+                try { if (before != null) Display.ApplyTopology(before); }
+                catch (Exception ex) { Log.Write("Revert failed: " + ex.Message); }
+                if (firstChange) { cfg.Switched = false; cfg.Save(); }
+                RefreshList();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool ApplyDefault()
+    {
+        RefreshListKeepSelection();
+        var t = monitors.FirstOrDefault(m => m.Key == cfg.DefaultMonitorKey);
+        if (t == null)
+        {
+            Log.Write("Default monitor not found/connected");
+            tray.ShowBalloonTip(4000, "Monitor Switcher", "Default monitor is not set or not connected.", ToolTipIcon.Warning);
+            return false;
+        }
+        return ApplySwitch(t);
+    }
+
+    bool ApplySwitch(MonInfo target)
+    {
+        bool firstSwitch = !cfg.Switched;
+        try
+        {
+            var current = Display.Enumerate();
+            if (firstSwitch)
+            {
+                cfg.SavedLayout = current;   // snapshot ONLY the first time, so we always return to the true original
+                try { cfg.SavedTopology = Display.CaptureTopology(); }
+                catch (Exception ex) { cfg.SavedTopology = null; Log.Write("Could not capture display configuration: " + ex.Message); }
+                cfg.Switched = true;
+                cfg.Save();
+            }
+            if (!target.Attached)
+            {
+                var turnedOn = Display.EnableMonitor(target, current,
+                    new[] { cfg.OffTopologies.GetValueOrDefault(target.Key), firstSwitch ? null : cfg.SavedTopology });
+                cfg.OffTopologies.Remove(target.Key);
+                current = Display.Enumerate();
+                target = current.FirstOrDefault(x => x.Attached && x.Key == turnedOn.Key)
+                         ?? throw new InvalidOperationException("The monitor did not turn on.");
+            }
+            Display.SetPrimary(target, current, cfg.TurnOffOthers);
+            Log.Write($"Primary set to {target.Label} ({target.Adapter}); turnOffOthers={cfg.TurnOffOthers}");
+        }
+        catch (Exception ex)
+        {
+            Log.Write("Apply failed: " + ex);
+            if (firstSwitch)
+            {
+                try { Display.Restore(cfg.SavedLayout, cfg.SavedTopology); } catch (Exception ex2) { Log.Write("Rollback failed: " + ex2.Message); }
+                cfg.Switched = false;
+                cfg.Save();
+            }
+            RefreshList();
+            MessageBox.Show(this, "Could not change the primary monitor:\n" + ex.Message +
+                "\n\nTip: check the log file in the 'logs' folder.", "Monitor Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+
+        RefreshList();
+
+        if (cfg.ConfirmChanges)
+        {
+            using var dlg = new ConfirmForm(15);
+            if (dlg.ShowDialog() != DialogResult.Yes)
+            {
+                RestoreLayout(true);
+                RefreshList();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool RestoreLayout(bool quiet)
+    {
+        if (!cfg.Switched || cfg.SavedLayout.Count == 0)
+        {
+            if (!quiet) MessageBox.Show(this, "Nothing to restore: the layout hasn't been changed.", "Monitor Switcher");
+            return true;
+        }
+        try
+        {
+            Display.Restore(cfg.SavedLayout, cfg.SavedTopology);
+            cfg.OffTopologies.Clear();
+            cfg.Switched = false;
+            cfg.Save();
+            Log.Write("Original layout restored");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Write("Restore failed: " + ex);
+            lastRestoreError = ex.Message;
+            if (!quiet)
+                MessageBox.Show(this, "Could not restore the layout:\n" + ex.Message, "Monitor Switcher",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    void HotkeyRestore()
+    {
+        if (!cfg.Switched)
+        {
+            tray.ShowBalloonTip(2500, "Monitor Switcher", "Nothing to restore.", ToolTipIcon.Info);
+            return;
+        }
+        bool ok = RestoreLayout(true);
+        RefreshList();
+        tray.ShowBalloonTip(3000, "Monitor Switcher",
+            ok ? "Previous display setup restored." : "Restore failed. See the log file.",
+            ok ? ToolTipIcon.Info : ToolTipIcon.Error);
+    }
+
+    // ── UI helpers ──
+    void RefreshListKeepSelection() => monitors = Display.Enumerate();
+
+    void RefreshList()
+    {
+        monitors = Display.Enumerate();
+        lv.Items.Clear();
+        foreach (var m in monitors)
+        {
+            var it = new ListViewItem(m.Label) { Tag = m };
+            it.SubItems.Add(m.Attached ? m.Adapter.Replace(@"\\.\", "") : "-");
+            it.SubItems.Add(m.Attached ? $"{m.Width} x {m.Height}" : "Off");
+            it.SubItems.Add(m.Attached ? $"{m.Freq} Hz" : "-");
+            it.SubItems.Add(m.Attached ? $"{m.X}, {m.Y}" : "-");
+            var tags = new List<string>();
+            if (m.Primary) tags.Add("Primary");
+            if (m.Key == cfg.DefaultMonitorKey) tags.Add("★ Default");
+            if (!m.Attached) tags.Add("Off");
+            it.SubItems.Add(string.Join(", ", tags));
+            if (!m.Attached) it.ForeColor = SystemColors.GrayText;
+            lv.Items.Add(it);
+        }
+        lblStatus.Text = cfg.Switched
+            ? "ACTIVE: display layout is switched. Close this app" + HotkeyHint + " to restore your original setup."
+            : "Idle: your layout is unchanged.";
+        if (!hotkeyOk) lblStatus.Text += "  (No restore hotkey is active: use Change... to pick one.)";
+
+        foreach (ColumnHeader c in lv.Columns) c.Width = -2;   // auto-size to the widest of header/content
+        UpdateToggleButton();
+    }
+
+    // Size the window so every column and row is visible without dragging.
+    void FitWindow()
+    {
+        var wa = Screen.FromControl(this).WorkingArea;
+        int cols = lv.Columns.Cast<ColumnHeader>().Sum(c => c.Width);
+        int needW = Math.Max(cols + SystemInformation.VerticalScrollBarWidth + 30, 720);
+
+        int rowH = lv.Items.Count > 0 ? lv.Items[0].Bounds.Height : 20;
+        int headerH = lv.Items.Count > 0 ? lv.Items[0].Bounds.Top : 26;
+        int needH = headerH + Math.Max(lv.Items.Count, 3) * rowH + 16 + bottom.Height;
+
+        ClientSize = new Size(Math.Min(needW, wa.Width - 40), Math.Min(Math.Max(needH, 320), wa.Height - 60));
+        CenterToScreen();
+    }
+
+    void HideToTray(string message)
+    {
+        Hide();
+        tray.ShowBalloonTip(4000, "Monitor Switcher", message, ToolTipIcon.Info);
+    }
+
+    void ShowFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+        RefreshList();
+    }
+
+    // ── Hotkey (Ctrl+Alt+M) ──
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        RegisterHotkey(true);
+    }
+
+    // (Re)registers the restore hotkey from the saved setting. At startup, if the shortcut is taken by another
+    // app, Shift is added as a fallback; when the user picks a new one, a conflict is reported instead.
+    void RegisterHotkey(bool allowShiftFallback)
+    {
+        UnregisterHotKey(Handle, HOTKEY_ID);
+        uint mods = cfg.HotkeyMods, key = cfg.HotkeyKey;
+        string wanted = HotkeyInfo.Text(mods, key);
+        hotkeyLabel = wanted;
+        hotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, mods | MOD_NOREPEAT, key);
+
+        if (!hotkeyOk && allowShiftFallback && (mods & MOD_SHIFT) == 0)
+        {
+            string alt = HotkeyInfo.Text(mods | MOD_SHIFT, key);
+            hotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, mods | MOD_SHIFT | MOD_NOREPEAT, key);
+            if (hotkeyOk)
+            {
+                hotkeyLabel = alt;
+                Log.Write($"Note: {wanted} is already used by another app, so the restore hotkey is {alt} instead. " +
+                          "You can pick a different one with the Change button.");
+            }
+        }
+        if (!hotkeyOk)
+            Log.Write($"Note: no restore hotkey is active because {wanted} is already used by another app. " +
+                      "Use the Change button to pick a different one.");
+
+        lblHotkey.Text = hotkeyOk ? $"Restore hotkey: {hotkeyLabel}" : "Restore hotkey: none active";
+        if (restoreItem != null)
+            restoreItem.Text = hotkeyOk ? $"Restore previous setup  ({hotkeyLabel})" : "Restore previous setup";
+    }
+
+    void OnChangeHotkey()
+    {
+        uint oldMods = cfg.HotkeyMods, oldKey = cfg.HotkeyKey;
+        using var dlg = new HotkeyForm(oldMods, oldKey);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        cfg.HotkeyMods = dlg.Mods;
+        cfg.HotkeyKey = dlg.Key;
+        RegisterHotkey(false);
+        if (!hotkeyOk)
+        {
+            MessageBox.Show(this, HotkeyInfo.Text(dlg.Mods, dlg.Key) + " is already used by another app. Please pick a different combination.",
+                "Monitor Switcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            cfg.HotkeyMods = oldMods;
+            cfg.HotkeyKey = oldKey;
+            RegisterHotkey(true);
+        }
+        else cfg.Save();
+        RefreshList();
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        UnregisterHotKey(Handle, HOTKEY_ID);
+        base.OnHandleDestroyed(e);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
+            BeginInvoke(new Action(HotkeyRestore));
+        base.WndProc(ref m);
+    }
+
+    // ── Closing = restore previous setup ──
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (cfg.Switched && !RestoreLayout(true))
+        {
+            bool shuttingDown = e.CloseReason == CloseReason.WindowsShutDown;
+            if (!shuttingDown)
+            {
+                var r = MessageBox.Show(this,
+                    "Your original layout could not be restored.\n\nReason: " + lastRestoreError +
+                    "\n\nExit anyway? (You can restore later by running MonitorSwitcher.exe --restore, or on the next launch.)",
+                    "Monitor Switcher", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (r == DialogResult.No) { e.Cancel = true; return; }
+            }
+        }
+        base.OnFormClosing(e);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        tray.Visible = false;
+        tray.Dispose();
+        base.OnFormClosed(e);
     }
 }

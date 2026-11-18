@@ -19,7 +19,7 @@ first and last lines of this block (the comment markers) to turn them on:
 
 A small, portable Windows tool that temporarily changes your **primary monitor**, so apps, games and videos open on the screen you want. Use it to play on a living room TV, present on a projector, or work on a different display, much like Steam Big Picture mode does. When you close the app, your **original display layout is restored**.
 
-> **Status:** v1.2. Please report problems in the Issues tab and include your log file (see [Troubleshooting](#troubleshooting)).
+> **Status:** v1.3. Please report problems in the Issues tab and include your log file (see [Troubleshooting](#troubleshooting)).
 
 ## Download
 
@@ -48,7 +48,7 @@ Windows may show a "Windows protected your PC" warning because the app isn't cod
 
 ### Hotkey
 
-**Ctrl + Alt + M** restores your previous setup at any time, even when the window is hidden in the system tray. If another app already uses that shortcut, the app switches to **Ctrl + Alt + Shift + M** and shows which one is active.
+**Ctrl + Alt + M** restores your previous setup at any time, even when the window is hidden in the system tray. If another app already uses that shortcut, the app switches to **Ctrl + Alt + Shift + M** and shows which one is active. You can also choose your own shortcut: click **Change...** next to *Restore hotkey*, press the keys you want, and click OK. The choice is saved in `config.json`.
 
 ### Command-line options
 
